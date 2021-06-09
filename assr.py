@@ -1,4 +1,6 @@
 from __future__ import print_function, division, absolute_import
+
+import keras
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -8,7 +10,7 @@ ms.use('seaborn-muted')
 # %matplotlib inline
 
 import librosa
-import soundfile as sf
+import soundfile
 import librosa.display
 import IPython.display
 
@@ -21,8 +23,12 @@ import logging
 import colorlog
 import progressbar
 
-# import tensorflow as tf
-# from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Activation
+from tensorflow.keras.losses import BinaryCrossentropy
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
 
 
 # Setting up progressbar and logger
@@ -32,6 +38,9 @@ handler = logging.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter('%(log_color)s%(levelname)-8s| %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+
+# Weighted MFCC
 
 
 class FeatureExtraction:
@@ -183,7 +192,7 @@ class Dataset:
                     audiofilename = subject + "-" + str(sampleStartTime) + "-" + str(sampleEndTime) + ".wav"
                     labelFile.write(audiofilename + " " + label + "\n")
                     audio = y[startingSample:endingSample]
-                    sf.write(os.path.join(self.datasetDir, audiofilename), audio, sr)
+                    soundfile.write(os.path.join(self.datasetDir, audiofilename), audio, sr)
 
         labelFile.close()
 
@@ -209,16 +218,225 @@ class Dataset:
         logger.info("Array read from file %s", filename)
 
 
-# Entrypoint
+# Bi-LSTM classifier
+
+
+class NeuralNetwork:
+    def __init__(self, X_train=None, X_test=None, Y_train=None, Y_test=None):
+        # Data
+        self.X_train = X_train
+        self.X_test = X_test
+        self.Y_train = Y_train
+        self.Y_test = Y_test
+
+        # Model configuration
+        self.learning_rate = 0.001
+        self.training_epochs = 1000
+        self.batch_size = 100
+
+        # Model
+        self.model = self.__network()
+        self.modelFile = None
+        self.loss = None
+        self.accuracy = None
+
+    def __network(self):
+        model = Sequential()
+        model.add(Bidirectional(LSTM(100), merge_mode='sum', input_shape=(1, 14)))
+        model.add(Dense(2))
+        model.add(Activation('sigmoid'))
+        model.compile(optimizer=Adam(), loss=BinaryCrossentropy(), metrics=['accuracy'])
+        model.summary()
+
+        return model
+
+    def train(self):
+        history = self.model.fit(self.X_train.reshape(-1, 1, 14), self.Y_train, batch_size=self.batch_size, epochs=self.training_epochs)
+        self.__test()
+        tfModelDir = "tfModels"
+        if not os.path.isdir(tfModelDir):
+            os.makedirs(tfModelDir)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H.%M.%S")
+        os.makedirs(os.path.join(tfModelDir, timestamp))
+        self.modelFile = os.path.join(os.path.join(tfModelDir, timestamp), 'model.h5')
+        self.model.save(self.modelFile)
+
+        logger.info("Model saved in file: %s" % self.modelFile)
+
+    def __test(self):
+        # Test model
+        test_results = self.model.evaluate(self.X_test.reshape(-1, 1, 14), self.Y_test)
+        logger.info("Model tested")
+        # Calculate accuracy
+        self.loss = test_results[0]
+        self.accuracy = 100 * test_results[1]
+        logger.info("Loss: %f", self.loss)
+        logger.info("Accuracy: %f", self.accuracy)
+
+    def getModelFile(self):
+        return self.modelFile
+
+    def loadAndClassify(self, filename, X):
+        self.model = keras.models.load_model(filename)
+        X = X.reshape(-1, 1, 14)
+        return self.model.predict(X)
+
+
+class AudioCorrection():
+    def __init__(self, audiofile, modelFile, segmentLength=100, segmentHop=50, n_features=14,
+                 correctionsDir='corrections'):
+        self.modelFile = modelFile
+        self.segmentLength = segmentLength
+        self.segmentHop = segmentHop
+        self.n_features = n_features
+        self.correctionsDir = correctionsDir
+        self.samplesPerSegment = None
+        self.samplesToSkipPerHop = None
+        self.upperLimit = None
+        self.audioFile = audiofile
+        self.y = None
+        self.sr = None
+        self.target_sr = 16000
+        NORMAL = 0
+        STUTTER = 1
+        self.speech = {NORMAL: [], STUTTER: []}
+        self.smoothingSamples = 1000
+        self.__loadfile(audiofile)
+
+    def __loadfile(self, inputFilename):
+        if not os.path.isfile(inputFilename):
+            logger.error("%s does not exists or is not a file", inputFilename)
+            sys.exit()
+        self.audioFile = inputFilename
+        logger.info("Loading file %s", self.audioFile)
+        self.y, self.sr = librosa.load(self.audioFile)
+        self.samplesPerSegment = int(self.segmentLength * self.sr / 1000)
+        self.samplesToSkipPerHop = int(self.segmentHop * self.sr / 1000)
+        self.upperLimit = len(self.y) - self.samplesPerSegment
+
+    def process(self):
+        logger.info("Attempting to correct %s", self.audioFile)
+        X = np.empty(shape=(0, self.n_features))
+        durations = np.empty(shape=(0, 2))
+
+        pbar = progressbar.ProgressBar()
+        start = 0
+        end = 0
+        for start in pbar(range(0, self.upperLimit, self.samplesToSkipPerHop)):
+            end = start + self.samplesPerSegment
+            audio = self.y[start:end]
+
+            featureVector = self.__getFeatureVector(audio, self.sr)
+            if featureVector != None:
+                X = np.vstack((X, [featureVector]))
+                durations = np.vstack((durations, [start, end]))
+
+        audio = self.y[end:]
+        featureVector = self.__getFeatureVector(audio, self.sr)
+        if featureVector != None:
+            X = np.vstack((X, [featureVector]))
+            durations = np.vstack((durations, [end, self.upperLimit + self.samplesPerSegment]))
+        logger.debug("Finished extracting features")
+
+        nn = NeuralNetwork()
+        classificationResult = nn.loadAndClassify(self.modelFile, X)
+        classificationResult = np.concatenate(np.hsplit(classificationResult, 2)[1])
+        classificationResult = np.round(classificationResult).astype(int)
+        logger.debug("Finished classification of segments")
+
+        currentSegment = {'type': classificationResult[0], 'start': durations[0][0], 'end': durations[0][1]}
+        for (label, [start, end]) in zip(classificationResult[1:], durations[1:]):
+            if currentSegment['type'] == label:
+                currentSegment['end'] = end
+            else:
+                self.speech[currentSegment['type']].append((currentSegment['start'], currentSegment['end']))
+                currentSegment['type'] = label
+                currentSegment['start'] = start
+                currentSegment['end'] = end
+
+    def __getFeatureVector(self, y, sr):
+        try:
+            features = FeatureExtraction()
+            features.load_y_sr(y, sr)
+            features.melspectrogram()
+            features.extractmfcc()
+            features.extractloge()
+        except ValueError:
+            logger.warning("Error extracting features")
+            return None
+
+        featureVector = []
+        for feature in features.wmfcc:
+            featureVector.append(np.mean(feature))
+
+        featureVector.append(np.mean(features.wloge))
+        return featureVector
+
+    def saveCorrectedAudio(self):
+        NORMAL = 0
+        STUTTER = 1
+        if not os.path.isdir(self.correctionsDir):
+            os.makedirs(self.correctionsDir)
+        outputFilenamePrefix = os.path.join(self.correctionsDir,
+                                            os.path.splitext(os.path.basename(self.audioFile))[0])
+
+        normalSpeech = np.ndarray(shape=(1, 0))
+        (start, end) = self.speech[NORMAL][0]
+        normalSpeech = np.append(normalSpeech, self.y[int(start):int(end)])
+        for (start, end) in self.speech[NORMAL][1:]:
+            # Smoothing
+            previousSample = normalSpeech[-1]
+            nextSample = self.y[int(start)]
+            if nextSample > previousSample:
+                low, high = previousSample, nextSample
+            else:
+                low, high = nextSample, previousSample
+
+            step = (high - low) / self.smoothingSamples
+
+            try:
+                normalSpeech = np.append(normalSpeech, np.arange(low, high, step))
+                normalSpeech = np.append(normalSpeech, self.y[int(start):int(end)])
+            except Exception as e:
+                print(e)
+
+        stutteredSpeech = np.ndarray(shape=(1, 0))
+        for (start, end) in self.speech[STUTTER]:
+            stutteredSpeech = np.append(stutteredSpeech, self.y[int(start):int(end)])
+
+        # Resampling the audio
+        logger.debug("Resampling corrected audio from %d to %d", self.sr, self.target_sr)
+        resampledNormalSpeech = librosa.resample(normalSpeech, self.sr, self.target_sr)
+        resampledStutteredSpeech = librosa.resample(stutteredSpeech, self.sr, self.target_sr)
+        soundfile.write(outputFilenamePrefix + "-corrected.wav", normalSpeech, self.sr)
+        soundfile.write(outputFilenamePrefix + "-stuttered.wav", stutteredSpeech, self.sr)
+        logger.info("Corrected audio saved as %s", outputFilenamePrefix + "-corrected.wav")
 
 
 def run(train=False, correct=False):
+    nn = None
     if train:
         dataset = Dataset('dataset', 'datasetLabels.txt', 'datasetArray.gz')
+        X_train, X_test, Y_train, Y_test = train_test_split(dataset.X, dataset.Y, train_size=0.8)
 
+        print(np.shape(X_train))
+        print(np.shape(Y_train))
 
-# In[ ]:
+        nn = NeuralNetwork(X_train, X_test, Y_train, Y_test)
+        nn.train()
+
+    if correct:
+        audiofile = 'records/s2_p2.wav'
+        if train:
+            modelFile = nn.getModelFile()
+        else:
+            modelFile = 'tfModels/2021-06-09-04.38.54/model.h5'
+
+        correction = AudioCorrection(audiofile, modelFile)
+        correction.process()
+        correction.saveCorrectedAudio()
+
 
 if __name__ == "__main__":
-    run(True, False)
+    run(False, True)
 
