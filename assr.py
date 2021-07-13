@@ -1,6 +1,5 @@
 from __future__ import print_function, division, absolute_import
 
-import keras
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -28,6 +27,7 @@ from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Activation
 from tensorflow.keras.losses import BinaryCrossentropy
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam
+
 from sklearn.model_selection import train_test_split
 
 
@@ -56,10 +56,7 @@ class FeatureExtraction:
         self.delta_mfcc = None
         self.delta2_mfcc = None
         self.wmfcc = None
-        self.loge = None
-        self.delta_loge = None
-        self.delta2_loge = None
-        self.wloge = None
+        self.rmse = None
 
     def loadFile(self, filename):
         self.y, self.sr = librosa.load(filename)
@@ -73,7 +70,7 @@ class FeatureExtraction:
         self.S = librosa.feature.melspectrogram(self.y, sr=self.sr, n_mels=self.n_mels)
         self.log_S = librosa.core.power_to_db(self.S)
 
-    def extractmfcc(self, n_mfcc=13):
+    def extractWMFCC(self, n_mfcc=13):
         self.mfcc = librosa.feature.mfcc(S=self.log_S, n_mfcc=n_mfcc)
         self.delta_mfcc = librosa.feature.delta(self.mfcc, mode='constant')
         self.delta2_mfcc = librosa.feature.delta(self.mfcc, order=2, mode='constant')
@@ -81,14 +78,8 @@ class FeatureExtraction:
                              self.delta_mfcc * self.delta_weight,
                              self.delta2_mfcc * self.delta2_weight], axis=0)
 
-    def extractloge(self):
-        energy = librosa.feature.melspectrogram(y=self.y, sr=self.sr, power=1)
-        self.loge = librosa.core.amplitude_to_db(energy)
-        self.delta_loge = librosa.feature.delta(self.loge, mode='constant')
-        self.delta2_loge = librosa.feature.delta(self.loge, order=2, mode='constant')
-        self.wloge = np.sum([self.loge,
-                             self.delta_loge * self.delta_weight,
-                             self.delta2_loge * self.delta2_weight], axis=0)
+    def extractRMSE(self):
+        self.rmse = np.mean(librosa.feature.rms(self.y, self.S))
 
 
 class Dataset:
@@ -119,7 +110,7 @@ class Dataset:
 
     def __build(self):
         logger.info("Building dataset from directory: %s", self.datasetDir)
-        num_lines = sum(1 for line in open(self.datasetLabelFilename, 'r'))
+        num_lines = sum(1 for _ in open(self.datasetLabelFilename, 'r'))
         with open(self.datasetLabelFilename, 'r') as datasetLabelFile:
             filesProcessed = 0
             pbar = progressbar.ProgressBar(redirect_stdout=True)
@@ -131,8 +122,8 @@ class Dataset:
                     features = FeatureExtraction()
                     features.loadFile(os.path.join(self.datasetDir, audiofilename))
                     features.melspectrogram()
-                    features.extractmfcc()
-                    features.extractloge()
+                    features.extractWMFCC()
+                    features.extractRMSE()
                 except ValueError:
                     logger.warning("Error in extracting features from file %s", audiofilename)
                     continue
@@ -141,7 +132,7 @@ class Dataset:
                 for feature in features.wmfcc:
                     featureVector.append(np.mean(feature))
 
-                featureVector.append(np.mean(features.wloge))
+                featureVector.append(np.mean(features.rmse))
 
                 self.X = np.vstack((self.X, [featureVector]))
 
@@ -165,7 +156,7 @@ class Dataset:
 
         labelFile = open(self.datasetLabelFilename, 'w')
 
-        splitDuration = 100  # milliseconds
+        splitDuration = 300  # milliseconds
         pbar = progressbar.ProgressBar(redirect_stdout=True)
         with open(recordsLabelsFileName, 'r') as recordsLabelsFile:
             for line in pbar(recordsLabelsFile):
@@ -251,7 +242,7 @@ class NeuralNetwork:
         return model
 
     def train(self):
-        history = self.model.fit(self.X_train.reshape(-1, 1, 14), self.Y_train, batch_size=self.batch_size, epochs=self.training_epochs)
+        self.model.fit(self.X_train.reshape(-1, 1, 14), self.Y_train, batch_size=self.batch_size, epochs=self.training_epochs)
         self.__test()
         tfModelDir = "tfModels"
         if not os.path.isdir(tfModelDir):
@@ -277,13 +268,13 @@ class NeuralNetwork:
         return self.modelFile
 
     def loadAndClassify(self, filename, X):
-        self.model = keras.models.load_model(filename)
+        self.model = tf.keras.models.load_model(filename)
         X = X.reshape(-1, 1, 14)
         return self.model.predict(X)
 
 
-class AudioCorrection():
-    def __init__(self, audiofile, modelFile, segmentLength=100, segmentHop=50, n_features=14,
+class AudioCorrection:
+    def __init__(self, audiofile, modelFile, segmentLength=300, segmentHop=100, n_features=14,
                  correctionsDir='corrections'):
         self.modelFile = modelFile
         self.segmentLength = segmentLength
@@ -359,8 +350,8 @@ class AudioCorrection():
             features = FeatureExtraction()
             features.load_y_sr(y, sr)
             features.melspectrogram()
-            features.extractmfcc()
-            features.extractloge()
+            features.extractWMFCC()
+            features.extractRMSE()
         except ValueError:
             logger.warning("Error extracting features")
             return None
@@ -369,7 +360,7 @@ class AudioCorrection():
         for feature in features.wmfcc:
             featureVector.append(np.mean(feature))
 
-        featureVector.append(np.mean(features.wloge))
+        featureVector.append(np.mean(features.rmse))
         return featureVector
 
     def saveCorrectedAudio(self):
@@ -406,10 +397,10 @@ class AudioCorrection():
 
         # Resampling the audio
         logger.debug("Resampling corrected audio from %d to %d", self.sr, self.target_sr)
-        resampledNormalSpeech = librosa.resample(normalSpeech, self.sr, self.target_sr)
-        resampledStutteredSpeech = librosa.resample(stutteredSpeech, self.sr, self.target_sr)
+        # resampledNormalSpeech = librosa.resample(normalSpeech, self.sr, self.target_sr)
+        # resampledStutteredSpeech = librosa.resample(stutteredSpeech, self.sr, self.target_sr)
         soundfile.write(outputFilenamePrefix + "-corrected.wav", normalSpeech, self.sr)
-        soundfile.write(outputFilenamePrefix + "-stuttered.wav", stutteredSpeech, self.sr)
+        # soundfile.write(outputFilenamePrefix + "-stuttered.wav", stutteredSpeech, self.sr)
         logger.info("Corrected audio saved as %s", outputFilenamePrefix + "-corrected.wav")
 
 
@@ -426,11 +417,11 @@ def run(train=False, correct=False):
         nn.train()
 
     if correct:
-        audiofile = 'records/s2_p2.wav'
+        audiofile = 'records/s3_p3.wav'
         if train:
             modelFile = nn.getModelFile()
         else:
-            modelFile = 'tfModels/2021-06-09-04.38.54/model.h5'
+            modelFile = 'tfModels/2021-06-16-05.56.37/model.h5'
 
         correction = AudioCorrection(audiofile, modelFile)
         correction.process()
@@ -438,5 +429,5 @@ def run(train=False, correct=False):
 
 
 if __name__ == "__main__":
-    run(False, True)
+    run(True, True)
 
